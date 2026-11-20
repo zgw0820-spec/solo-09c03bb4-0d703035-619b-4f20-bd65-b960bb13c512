@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,11 @@ class ImageModel:
     layers: tuple[LayerBlob, ...]
     platform: dict[str, Any]
     config_history_size: int
+    # 原始文档：导出流程需要在其基础上重建 config/manifest/index 并重算摘要
+    config_doc: dict[str, Any] = field(default_factory=dict)
+    manifest_doc: dict[str, Any] = field(default_factory=dict)
+    index_doc: dict[str, Any] = field(default_factory=dict)
+    manifest_descriptor: dict[str, Any] = field(default_factory=dict)
 
 
 def _read_json(path: Path) -> Any:
@@ -153,4 +158,8 @@ def load_image(root: Path) -> ImageModel:
         layers=tuple(layers),
         platform=platform,
         config_history_size=len(history) if isinstance(history, list) else 0,
+        config_doc=config_doc,
+        manifest_doc=manifest_doc,
+        index_doc=index_doc,
+        manifest_descriptor=descriptor,
     )

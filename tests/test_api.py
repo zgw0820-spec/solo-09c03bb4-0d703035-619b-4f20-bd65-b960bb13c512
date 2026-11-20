@@ -160,3 +160,24 @@ def test_path_traversal_archive_rejected(client, tmp_path, sample_archive):
         )
     assert resp.status_code == 400
     assert not (tmp_path.parent / "escape.txt").exists()
+
+
+def test_non_oci_tar_rejected_as_400(client, tmp_path):
+    """合法 tar 但缺少 oci-layout/index.json：返回 400 与原因，而不是 500。"""
+    import io
+    import tarfile
+
+    plain = tmp_path / "plain.tar"
+    with tarfile.open(plain, "w") as tar:
+        data = b"hello"
+        info = tarfile.TarInfo(name="readme.txt")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    with open(plain, "rb") as handle:
+        resp = client.post(
+            "/diagnose",
+            files={"archive": ("plain.tar", handle, "application/x-tar")},
+            data={"target_path": "/x"},
+        )
+    assert resp.status_code == 400
+    assert "oci-layout" in resp.json()["detail"]

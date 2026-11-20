@@ -70,6 +70,19 @@ class Mask:
     opaque_dir: Optional[str] = None  # opaque 时记录被标记的目录绝对路径
 
 
+@dataclass(frozen=True)
+class ContentRef:
+    """普通文件内容在（已解压）层 tar 中的位置，供导出时流式回读。
+
+    只在 ``merge_layers(..., capture_content=True)`` 时填充；
+    诊断流程不记录内容位置，行为与之前完全一致。
+    """
+
+    tar_path: str  # 层 tar（导出流程中已解压为裸 tar）的磁盘路径
+    offset: int  # 成员数据在 tar 文件中的起始偏移
+    size: int  # 内容字节数
+
+
 @dataclass
 class Node:
     kind: NodeKind
@@ -80,6 +93,14 @@ class Node:
     mask: Optional[Mask] = None  # 仅墓碑使用
     # 挂载点：被替换下来的旧子树根，用于解释“为什么挂载点下面的镜像文件没了”
     replaced: Optional["Node"] = None
+    # ---- 导出所需的归档元数据（权限/属主/时间），诊断流程不参与序列化 ----
+    mode: int = 0o755  # 权限位（tar 成员 mode）
+    uid: int = 0
+    gid: int = 0
+    uname: str = ""
+    gname: str = ""
+    mtime: float = 0.0
+    content: Optional[ContentRef] = None  # 普通文件的内容位置（capture_content 时）
 
 
 # --------------------------------------------------------------------------- #
@@ -106,8 +127,21 @@ def _ensure_child_dir(parent: Node, name: str, source: Source) -> Node:
     return existing
 
 
-def _new_dir(source: Source) -> Node:
-    return Node(kind=NodeKind.DIRECTORY, source=source)
+def _new_dir(source: Source, member: Optional[tarfile.TarInfo] = None) -> Node:
+    node = Node(kind=NodeKind.DIRECTORY, source=source)
+    if member is not None:
+        _apply_meta(node, member)
+    return node
+
+
+def _apply_meta(node: Node, member: tarfile.TarInfo) -> None:
+    """把 tar 成员的权限/属主/时间元数据记录到节点上（导出时原样回写）。"""
+    node.mode = member.mode if member.mode is not None else node.mode
+    node.uid = member.uid
+    node.gid = member.gid
+    node.uname = member.uname or ""
+    node.gname = member.gname or ""
+    node.mtime = member.mtime
 
 
 # --------------------------------------------------------------------------- #
@@ -119,6 +153,7 @@ def _new_dir(source: Source) -> Node:
 class _PendingEntry:
     parts: list[str]
     member: tarfile.TarInfo
+    tar_path: str  # 该成员所属层 tar 的磁盘路径（内容回读用）
 
 
 def _apply_whiteout(root: Node, parts: list[str], source: LayerSource) -> None:
@@ -166,7 +201,13 @@ def _apply_opaque(root: Node, dir_parts: list[str], source: LayerSource) -> None
         )
 
 
-def _apply_entry(root: Node, entry: _PendingEntry, source: LayerSource) -> None:
+def _apply_entry(
+    root: Node,
+    entry: _PendingEntry,
+    source: LayerSource,
+    *,
+    capture_content: bool = False,
+) -> None:
     parts = entry.parts
     member = entry.member
 
@@ -180,23 +221,31 @@ def _apply_entry(root: Node, entry: _PendingEntry, source: LayerSource) -> None:
     if member.isdir():
         existing = cursor.children.get(name)
         if existing is not None and existing.kind == NodeKind.DIRECTORY:
-            return  # 目录合并且保留下层已有子项
-        cursor.children[name] = _new_dir(source)
+            # 目录合并：保留下层已有子项，但权限/属主等元数据与来源
+            # 以更高层的显式目录条目为准（与 overlay 上层目录语义一致）。
+            existing.source = source
+            _apply_meta(existing, member)
+            return
+        cursor.children[name] = _new_dir(source, member)
         return
 
     if member.issym():
         target = member.linkname or ""
         if len(target.encode("utf-8", "replace")) > MAX_SYMLINK_TARGET_BYTES:
             raise ValueError(f"符号链接目标过长: {member.name}")
-        cursor.children[name] = Node(
-            kind=NodeKind.SYMLINK, source=source, link_target=target
-        )
+        node = Node(kind=NodeKind.SYMLINK, source=source, link_target=target)
+        _apply_meta(node, member)
+        cursor.children[name] = node
         return
 
     if member.isreg():
-        cursor.children[name] = Node(
-            kind=NodeKind.FILE, source=source, size=member.size
-        )
+        node = Node(kind=NodeKind.FILE, source=source, size=member.size)
+        _apply_meta(node, member)
+        if capture_content:
+            node.content = ContentRef(
+                tar_path=entry.tar_path, offset=member.offset_data, size=member.size
+            )
+        cursor.children[name] = node
         return
 
     if member.islnk():
@@ -209,9 +258,14 @@ def _apply_entry(root: Node, entry: _PendingEntry, source: LayerSource) -> None:
             raise ValueError(
                 f"硬链接目标在归档中不存在或不是普通文件: {member.name} -> {member.linkname}"
             )
-        cursor.children[name] = Node(
-            kind=NodeKind.FILE, source=target_node.source, size=target_node.size
+        node = Node(
+            kind=NodeKind.FILE,
+            source=target_node.source,
+            size=target_node.size,
+            content=target_node.content,
         )
+        _apply_meta(node, member)
+        cursor.children[name] = node
         return
 
     # 字符/块设备、fifo 等：诊断场景无意义，明确拒绝而不是静默忽略
@@ -247,8 +301,14 @@ def _open_layer_tar(blob_path: str) -> tarfile.TarFile:
         raise ValueError(f"层 blob 无法作为 tar 读取: {exc}") from exc
 
 
-def merge_layers(layers: tuple[LayerBlob, ...]) -> Node:
-    """把所有层合并成一棵以根目录节点表示的文件树。"""
+def merge_layers(layers: tuple[LayerBlob, ...], capture_content: bool = False) -> Node:
+    """把所有层合并成一棵以根目录节点表示的文件树。
+
+    ``capture_content=True`` 时（导出流程），普通文件节点会记录内容在
+    层 tar 中的位置（``Node.content``），并采集权限/属主/时间元数据；
+    调用方需保证 ``LayerBlob.path`` 指向可随机访问的（已解压）tar，
+    且在树使用完毕前不要删除这些文件。
+    """
     root = Node(kind=NodeKind.DIRECTORY, source=LayerSource(kind="layer", layer_index=-1, digest="<root>"))
 
     for layer in layers:
@@ -258,11 +318,12 @@ def merge_layers(layers: tuple[LayerBlob, ...]) -> Node:
             digest=layer.digest,
             diff_id=layer.diff_id,
         )
+        tar_path = str(layer.path)
         pending: list[_PendingEntry] = []
         deferred_links: list[_PendingEntry] = []
         # 随机访问 tar：whiteout/opaque 先应用，普通条目按归档内原始顺序随后应用，
         # 从而保证“同层遮蔽后新增仍可见”；硬链接若暂时找不到目标则延后一轮。
-        with _open_layer_tar(str(layer.path)) as tar:
+        with _open_layer_tar(tar_path) as tar:
             members = tar.getmembers()
             for member in members:
                 if member.isdir() and not member.name:
@@ -283,7 +344,9 @@ def merge_layers(layers: tuple[LayerBlob, ...]) -> Node:
                         raise ValueError(f"非法 whiteout 名称: {member.name}")
                     _apply_whiteout(root, wh_parts, source)
                     continue
-                pending.append(_PendingEntry(parts=parts, member=member))
+                pending.append(
+                    _PendingEntry(parts=parts, member=member, tar_path=tar_path)
+                )
 
             for entry in pending:
                 if entry.member.islnk():
@@ -292,7 +355,7 @@ def merge_layers(layers: tuple[LayerBlob, ...]) -> Node:
                     if target_node is None or target_node.kind != NodeKind.FILE:
                         deferred_links.append(entry)
                         continue
-                _apply_entry(root, entry, source)
+                _apply_entry(root, entry, source, capture_content=capture_content)
 
             # 第二轮：处理目标在同层稍后才出现的硬链接
             for entry in deferred_links:
@@ -307,6 +370,6 @@ def merge_layers(layers: tuple[LayerBlob, ...]) -> Node:
                         f"硬链接目标在归档中不存在或不是普通文件: "
                         f"{entry.member.name} -> {entry.member.linkname}"
                     )
-                _apply_entry(root, entry, source)
+                _apply_entry(root, entry, source, capture_content=capture_content)
 
     return root

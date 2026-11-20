@@ -8,6 +8,10 @@
 4. 逐层合并内存文件树（whiteout / opaque 语义）；
 5. 应用目录挂载（整棵子树替换）；
 6. 在挂载后的容器视图里解析目标绝对路径，返回来源或断裂定位。
+
+另提供 /export：把分层合并后的可见文件视图重打成单层 gzip 层，
+重建 config/manifest/index 摘要引用并自检通过后，输出可独立导入的
+OCI Image Layout tar 下载包。
 """
 
 from __future__ import annotations
@@ -19,10 +23,12 @@ import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 
 from . import __version__
 from .archive import ArchiveFormatError, UnsafeArchiveError, safe_extract_tar
+from .export import ExportError, ExportResult, export_image
 from .layers import merge_layers
 from .models import DiagnosisResponse, HealthResponse
 from .mounts import MountError, MountRequest, apply_mounts
@@ -39,6 +45,7 @@ app = FastAPI(
         "返回该路径在分层合并 + 目录挂载后的容器视图中的解析结果与来源；"
         "找不到时指出断裂路径段以及 whiteout / opaque / 挂载等遮蔽来源，"
         "符号链接成环时明确报错。"
+        "另支持把镜像合并视图导出为可独立导入的单层 OCI 镜像包（/export）。"
     ),
 )
 
@@ -140,9 +147,8 @@ async def diagnose(
             raise HTTPException(status_code=400, detail=f"归档解析失败: {exc}") from exc
 
         # OCI 布局允许根目录即布局根，也允许单层包裹目录
-        layout_root = _find_layout_root(extract_dir)
-
         try:
+            layout_root = _find_layout_root(extract_dir)
             image = load_image(layout_root)
             tree = merge_layers(image.layers)
             apply_mounts(tree, mount_requests)
@@ -181,3 +187,74 @@ def _find_layout_root(extract_dir: Path) -> Path:
         if (candidate / "oci-layout").is_file() and (candidate / "index.json").is_file():
             return candidate
     raise OCIParseError("解包后找不到 oci-layout / index.json，不是合法的 OCI Image Layout")
+
+
+@app.post(
+    "/export",
+    tags=["导出"],
+    summary="把镜像合并视图导出为可独立导入的单层 OCI 镜像包",
+    responses={
+        200: {
+            "description": "打包并自检通过后的单层 OCI Image Layout tar 下载包",
+            "content": {"application/x-tar": {}},
+        },
+        400: {"description": "归档、OCI 布局或镜像层非法（detail 说明原因）"},
+        413: {"description": "归档超过大小上限"},
+        422: {"description": "表单字段校验失败"},
+        500: {"description": "打包或导出包自检失败（detail 说明原因），不提供下载"},
+    },
+)
+async def export_single_layer(
+    archive: UploadFile = File(..., description="单平台 OCI Image Layout tar（层可为 gzip）"),
+) -> FileResponse:
+    """把上传镜像按层合并后的可见文件视图重打成单层 gzip 层：
+
+    * 保留可见文件的内容、权限、属主与符号链接目标，目录保留权限与属主；
+    * whiteout / opaque 遮蔽掉的条目不会出现在产物中；
+    * 保留原镜像的平台与启动配置，重建层 / 配置 / 清单三级摘要引用；
+    * 产物重新加载并逐路径自检通过后才提供下载，失败时返回具体原因。
+    """
+    work_dir = Path(tempfile.mkdtemp(prefix="oci-export-"))
+    try:
+        extract_dir = work_dir / "layout"
+        extract_dir.mkdir()
+        try:
+            archive_path = _spool_upload(archive, work_dir)
+            safe_extract_tar(archive_path, extract_dir)
+        except (UnsafeArchiveError, ArchiveFormatError) as exc:
+            raise HTTPException(status_code=400, detail=f"归档解析失败: {exc}") from exc
+
+        try:
+            layout_root = _find_layout_root(extract_dir)
+            image = load_image(layout_root)
+        except OCIParseError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            result: ExportResult = export_image(image, work_dir)
+        except ValueError as exc:
+            # 层解压/合并中的输入性问题（非法成员、diff_id 不符、不支持的压缩格式等）
+            raise HTTPException(status_code=400, detail=f"镜像层处理失败: {exc}") from exc
+        except ExportError as exc:
+            logger.exception("导出打包/自检失败")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
+
+    logger.info(
+        "导出成功: %s（文件 %d / 目录 %d / 符号链接 %d，manifest %s）",
+        result.filename,
+        result.file_count,
+        result.dir_count,
+        result.symlink_count,
+        result.manifest_digest,
+    )
+    # 下载流式发送完毕后再清理临时目录
+    cleanup = BackgroundTask(shutil.rmtree, work_dir, ignore_errors=True)
+    return FileResponse(
+        path=str(result.package_path),
+        media_type="application/x-tar",
+        filename=result.filename,
+        background=cleanup,
+    )

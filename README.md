@@ -6,6 +6,10 @@ opaque 遮蔽）还是哪个**挂载点**（卷整棵替换了镜像子树）。
 tar（层 blob 支持 gzip 或裸 tar）与容器内绝对路径，按「分层合并 → 目录挂载 → 符号链接
 解析」的容器视图给出解析结果与可定位的来源。
 
+另外，离线节点拿不到原镜像仓库时，`POST /export` 可以把镜像按层合并后的可见文件视图
+**重打成单层 gzip 层**，重建 config / manifest / index 三级摘要引用，输出可独立导入的
+OCI Image Layout tar 下载包（打包后先自检，通过才提供下载）。
+
 ## 语义约定
 
 | 场景 | 行为 |
@@ -24,13 +28,14 @@ tar（层 blob 支持 gzip 或裸 tar）与容器内绝对路径，按「分层�
 app/
   archive.py   外层 tar 安全解包（禁绝对路径/.. 越界/危险成员类型）+ sha256
   oci.py       OCI 布局、index/manifest/config 解析与 blob 摘要校验
-  layers.py    层合并引擎（whiteout/opaque/墓碑/硬链接）
+  layers.py    层合并引擎（whiteout/opaque/墓碑/硬链接，采集权限/属主/内容位置）
   mounts.py    目录挂载（挂载点校验、卷子树替换、嵌套挂载拒绝）
   resolver.py  容器视图路径解析（符号链接、环检测、断裂定位）
+  export.py    单层重打包：层解压、合并视图写 gzip 层、重建摘要引用、产物自检
   models.py    Pydantic 请求/响应模型（驱动 Swagger）
   main.py      FastAPI 路由
 scripts/build_sample_oci.py  构造三层演示镜像
-tests/         41 个 pytest 用例（层语义/解析器/端到端 API/安全）
+tests/         54 个 pytest 用例（层语义/解析器/端到端 API/导出/安全）
 ```
 
 ## 用 Docker Compose 启动
@@ -43,7 +48,8 @@ docker compose up --build
 # 健康检查:     GET /health
 ```
 
-容器以非 root 用户运行，上传内容写入 tmpfs（默认上限 512 MiB），请求结束即删。
+容器以非 root 用户运行，上传内容写入 tmpfs（默认上限 2 GiB，导出流程需要
+「上传包 + 解包布局 + 解压层 + 单层产物」的额外空间），请求结束即删。
 
 ## 在 Swagger 里试查样例
 
@@ -88,6 +94,32 @@ curl -F "archive=@samples/sample-oci.tar.gz" \
      http://localhost:8000/diagnose
 ```
 
+## 导出单层镜像包（离线导入）
+
+`POST /export` 接收与诊断接口相同的上传表单（仅 `archive` 一个字段），把镜像按层合并
+后的**容器可见文件视图**重打成单层镜像包：
+
+| 方面 | 行为 |
+| --- | --- |
+| 可见文件 | 内容、权限（mode）、属主（uid/gid/uname/gname）原样保留；大文件全程 1 MiB 分块读写，不进内存 |
+| 目录 | 显式目录条目保留权限与属主（多层同名目录以最高层条目为准） |
+| 符号链接 | 保留原始链接目标字符串（绝对/相对/`..` 均不重写） |
+| 硬链接 | 同内容条目在层内去重为硬链接成员，两个路径都能读到同一份内容 |
+| whiteout / opaque | 只影响合并视图；标记本身与被遮蔽条目都不会出现在产物里 |
+| 平台与启动配置 | config 的 `os`/`architecture`/`variant` 与 `config` 段（Env/Cmd/Entrypoint/WorkingDir/User/Labels 等）原样保留 |
+| 摘要引用 | 层 diff_id/blob 摘要、config 摘要、manifest 摘要、index 描述符全部按新内容重算 |
+| 自检 | 产物重新加载（校验全部 blob 摘要）→ 重新解压合并 → 与原视图逐路径比对类型/权限/属主/链接目标/内容摘要，全部通过才提供下载；任一步失败返回具体原因，不给文件 |
+
+```bash
+curl -OJ -F "archive=@samples/sample-oci.tar.gz" http://localhost:8000/export
+# 得到 <镜像名>-single-layer.tar（单层 OCI Image Layout），可拷贝到离线节点：
+#   ctr images import oci-image-<id>-single-layer.tar
+#   podman load -i  oci-image-<id>-single-layer.tar   # oci-archive 格式
+```
+
+导出包可再次喂回本服务：`/diagnose` 查到与原镜像一致的可见视图（层数为 1），
+`/export` 幂等。
+
 ## 响应模型摘要
 
 ```jsonc
@@ -112,14 +144,16 @@ curl -F "archive=@samples/sample-oci.tar.gz" \
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt pytest httpx
-.venv/bin/python -I -m pytest          # 41 个用例
+.venv/bin/python -I -m pytest          # 54 个用例
 PYTHONPATH=. .venv/bin/python -I -m uvicorn app.main:app --port 8000
 ```
 
 ## 安全说明
 
-* 每个请求使用独立临时目录，结束后整体删除；
+* 每个请求使用独立临时目录，结束后整体删除（下载流送完才清理）；
 * 外层 tar 拒绝绝对路径、`..` 跳转、设备/fifo 等成员，符号链接目标禁止逃逸解包根；
 * 所有内容寻址 blob 按 sha256 校验，摘要不符直接拒绝；
+* 导出时额外校验每层解压后的 diff_id 与 config 声明一致；
 * 层 tar 仅在内存中读取元数据（类型/链接名/大小），不提取、不执行任何归档内容；
+  导出流程只把普通文件内容流式拷贝进新层，同样不落盘执行；
 * 上传体积默认上限 512 MiB（`app/main.py` 可调）。
